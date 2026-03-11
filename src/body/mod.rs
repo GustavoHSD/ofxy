@@ -83,6 +83,7 @@ pub struct Transaction {
     pub id: String,
     pub name: Option<String>,
     pub memo: Option<String>,
+    pub checknum: Option<String>,
     pub currency: Option<Currency>,
 }
 
