@@ -19,6 +19,40 @@ pub struct Ofx {
     pub body: body::Body,
 }
 
+impl Ofx {
+    /// Parses an OFX file from a string, collecting all errors (syntax, missing fields, invalid conversions)
+    /// into a vector instead of returning on the first error.
+    ///
+    /// Returns a tuple containing the successfully parsed parts (if any) and a
+    /// vector of all encountered errors.
+    pub fn parse_collect_errors(s: &str) -> (Option<Self>, Vec<Error>) {
+        let mut errors = Vec::new();
+
+        let start = match s.find("<OFX>") {
+            Some(idx) => idx,
+            None => {
+                errors.push(Error::ParseError("no `<OFX>` found".into()));
+                return (None, errors);
+            }
+        };
+
+        let (raw_header, raw_body) = (&s[..start], &s[start..]);
+
+        let (header, header_errors) = header::Header::parse_collect_errors(raw_header);
+        errors.extend(header_errors);
+
+        let (body, body_errors) = body::Body::parse_collect_errors(raw_body);
+        errors.extend(body_errors);
+
+        let ofx = match (header, body) {
+            (Some(header), Some(body)) => Some(Self { header, body }),
+            _ => None,
+        };
+
+        (ofx, errors)
+    }
+}
+
 impl FromStr for Ofx {
     type Err = Error;
 

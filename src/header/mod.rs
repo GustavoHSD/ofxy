@@ -2,7 +2,7 @@ use std::{collections::HashMap, str::FromStr};
 
 use serde::Deserialize;
 
-use crate::{Result, error::Error};
+use crate::{Result, error::{Error, Location}};
 
 // Per the 1.6 spec, 2.2:
 // All OFX headers are required. NONE should be returned if client or server does not make use of
@@ -20,6 +20,161 @@ pub struct Header {
     pub newfileuid: String,
 }
 
+impl Header {
+    /// Parses headers from a string, collecting all errors (syntax, missing fields, invalid conversions)
+    /// into a vector instead of returning on the first error.
+    pub fn parse_collect_errors(s: &str) -> (Option<Self>, Vec<Error>) {
+        let mut errors = Vec::new();
+        let prolog_flag = "<?OFX ";
+        let mut headers_map = HashMap::new();
+
+        if let Some(start) = s.find(prolog_flag) {
+            let Some(end_delta) = s[start..].find("?>") else {
+                errors.push(Error::ParseError("invalid OFX header: missing '?>'".into()));
+                return (None, errors);
+            };
+            let end = start + end_delta;
+            let prolog_contents = &s[start + prolog_flag.len()..end];
+            for segment in prolog_contents.split(r#"" "#) {
+                let segment = segment.trim();
+                if segment.is_empty() {
+                    continue;
+                }
+                if let Some((key, value)) = segment.split_once('=') {
+                    headers_map.insert(key.to_string(), value.trim_matches('"').to_string());
+                } else {
+                    errors.push(Error::ParseError(format!("invalid OFX header at {segment}")));
+                }
+            }
+        } else {
+            for (i, line) in s.lines().enumerate() {
+                let line_num = i + 1;
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once(':') {
+                    headers_map.insert(key.to_string(), value.to_string());
+                } else {
+                    errors.push(Error::Located {
+                        location: Location {
+                            line: line_num,
+                            column: 1,
+                        },
+                        msg: format!("invalid OFX header at {line}"),
+                    });
+                }
+            }
+        }
+
+        let ofxheader = match headers_map.get("OFXHEADER") {
+            Some(v) => match v.parse::<u32>() {
+                Ok(val) => Some(val),
+                Err(e) => {
+                    errors.push(Error::from(e));
+                    None
+                }
+            },
+            None => {
+                errors.push(Error::ParseError("headers missing 'OFXHEADER'".into()));
+                None
+            }
+        };
+
+        let data = match headers_map.get("DATA") {
+            Some(v) => match v.parse() {
+                Ok(val) => val,
+                Err(e) => {
+                    errors.push(e);
+                    Data::default()
+                }
+            },
+            None => Data::default(),
+        };
+
+        let version = match headers_map.get("VERSION") {
+            Some(v) => match v.parse() {
+                Ok(val) => Some(val),
+                Err(e) => {
+                    errors.push(e);
+                    None
+                }
+            },
+            None => {
+                errors.push(Error::ParseError("headers missing 'VERSION'".into()));
+                None
+            }
+        };
+
+        let security = match headers_map.get("SECURITY") {
+            Some(v) => match v.parse() {
+                Ok(val) => val,
+                Err(e) => {
+                    errors.push(e);
+                    Security::default()
+                }
+            },
+            None => Security::default(),
+        };
+
+        let encoding = match headers_map.get("ENCODING") {
+            Some(v) => match v.parse() {
+                Ok(val) => val,
+                Err(e) => {
+                    errors.push(e);
+                    Encoding::default()
+                }
+            },
+            None => Encoding::default(),
+        };
+
+        let charset = match headers_map.get("CHARSET") {
+            Some(v) => Some(v.clone()),
+            None => {
+                errors.push(Error::ParseError("headers missing 'CHARSET'".into()));
+                None
+            }
+        };
+
+        let compression = headers_map.get("COMPRESSION").cloned().unwrap_or_default();
+
+        let oldfileuid = match headers_map.get("OLDFILEUID") {
+            Some(v) => Some(v.clone()),
+            None => {
+                errors.push(Error::ParseError("headers missing 'OLDFILEUID'".into()));
+                None
+            }
+        };
+
+        let newfileuid = match headers_map.get("NEWFILEUID") {
+            Some(v) => Some(v.clone()),
+            None => {
+                errors.push(Error::ParseError("headers missing 'NEWFILEUID'".into()));
+                None
+            }
+        };
+
+        let header = match (ofxheader, version, charset, oldfileuid, newfileuid) {
+            (Some(ofxheader), Some(version), Some(charset), Some(oldfileuid), Some(newfileuid)) => {
+                Some(Self {
+                    ofxheader,
+                    data,
+                    version,
+                    security,
+                    encoding,
+                    charset,
+                    compression,
+                    oldfileuid,
+                    newfileuid,
+                })
+            }
+            _ => None,
+        };
+
+        (header, errors)
+    }
+}
+
 impl FromStr for Header {
     type Err = Error;
 
@@ -35,7 +190,8 @@ impl FromStr for Header {
             let prolog_contents = &s[start + prolog_flag.len()..end];
             prolog_contents
                 .split(r#"" "#)
-                .map(|s| {
+                .enumerate()
+                .map(|(_i, s)| {
                     let s = s.trim();
                     let Some((key, value)) = s.split_once('=') else {
                         return Err(Error::ParseError(format!("invalid OFX header at {s}")));
@@ -45,11 +201,19 @@ impl FromStr for Header {
                 .collect::<Result<HashMap<_, _>>>()?
         } else {
             s.lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| {
+                .enumerate()
+                .filter(|(_, line)| !line.trim().is_empty())
+                .map(|(i, line)| {
+                    let line_num = i + 1;
                     let line = line.trim();
                     let Some((key, value)) = line.split_once(':') else {
-                        return Err(Error::ParseError(format!("invalid OFX header at {line}")));
+                        return Err(Error::Located {
+                            location: Location {
+                                line: line_num,
+                                column: 1,
+                            },
+                            msg: format!("invalid OFX header at {line}"),
+                        });
                     };
                     Ok((key.to_string(), value.to_string()))
                 })

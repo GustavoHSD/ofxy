@@ -207,3 +207,59 @@ fn test_citi() {
         Decimal::from_str("-127.15").unwrap()
     );
 }
+
+#[test]
+fn test_parse_collect_errors() {
+    let input = "OFXHEADER:not_a_number
+DATA:OFXSGML
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+this_line_is_completely_invalid
+
+<OFX>";
+
+    let (ofx, errors) = Ofx::parse_collect_errors(input);
+    assert!(ofx.is_none());
+
+    // We expect 3 errors:
+    // 1. OFXHEADER parsing failure (invalid digit)
+    // 2. Missing VERSION header
+    // 3. Completely invalid line
+    assert_eq!(errors.len(), 3);
+
+    let error_msgs: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+
+    // OFXHEADER parse error
+    assert!(error_msgs.iter().any(|msg| msg.contains("invalid digit found in string")));
+    // Missing VERSION
+    assert!(error_msgs.iter().any(|msg| msg.contains("headers missing 'VERSION'")));
+    // Completely invalid line
+    assert!(error_msgs.iter().any(|msg| msg.contains("invalid OFX header at this_line_is_completely_invalid")));
+}
+
+#[test]
+fn test_parse_collect_errors_success() {
+    let input = "OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+
+<OFX><SIGNONMSGSRSV1><SONRS><STATUS><CODE>0<SEVERITY>INFO</STATUS><DTSERVER>20250126120000[0:GMT]<LANGUAGE>ENG<FI><ORG>Apple Card<FID>23456</FI></SONRS></SIGNONMSGSRSV1></OFX>";
+
+    let (ofx, errors) = Ofx::parse_collect_errors(input);
+    assert!(ofx.is_some());
+    assert!(errors.is_empty());
+
+    let ofx = ofx.unwrap();
+    assert_eq!(ofx.header.ofxheader, 100);
+}
+

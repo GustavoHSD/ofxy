@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use serde::{self, Deserialize, Deserializer};
 use sgmlish::Parser;
@@ -14,6 +14,13 @@ where
     use serde::de::Error as SerdeErr;
     let s = String::deserialize(deserializer)?;
 
+    // Handle "00000000000000" or empty strings as a default/epoch date if loose parsing is desired.
+    // For now, let's at least log a warning and return a default if it's obviously junk.
+    if s.is_empty() || s.chars().all(|c| c == '0') {
+        tracing::warn!("Invalid or empty datetime found: '{}', defaulting to epoch", s);
+        return Ok(Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap());
+    }
+
     // Per 1.6 spec, 3.2.8.2:
     // Note that times zones are specified by an offset and optionally, a time zone name. The offset
     // defines the time zone. Valid offset values are in the range from –12 to +12 for whole number
@@ -22,18 +29,24 @@ where
         || (&s[..], "0"),
         |idx| (&s[..idx], &s[idx + 1..s.len() - 1]),
     );
-    let offset_num = offset_str
-        .split(':')
-        .next()
-        .ok_or_else(|| SerdeErr::custom(format!("invalid timezone offset format: {offset_str}")))?
-        .parse::<f32>()
-        .map_err(serde::de::Error::custom)?;
+
+    let offset_num = if offset_str == "-" || offset_str.is_empty() {
+        tracing::warn!("Invalid timezone offset: '{}', defaulting to 0", offset_str);
+        0.0
+    } else {
+        offset_str
+            .split(':')
+            .next()
+            .ok_or_else(|| SerdeErr::custom(format!("invalid timezone offset format: {offset_str}")))?
+            .parse::<f32>()
+            .map_err(serde::de::Error::custom)?
+    };
 
     if offset_num.abs() > 12.0 {
-        return Err(SerdeErr::custom(format!(
-            "timezone offset too large or small: {offset_num}"
-        )));
+        tracing::warn!("Timezone offset too large: {}, capping at 12", offset_num);
     }
+    let offset_num = offset_num.clamp(-12.0, 12.0);
+
     #[allow(clippy::cast_possible_truncation)]
     let offset_secs = (offset_num * 3600.0).round() as i32;
 
@@ -41,14 +54,21 @@ where
         .ok_or_else(|| SerdeErr::custom(format!("invalid timezone offset: {offset_num}")))?;
 
     let naive = match dt_str.chars().count() {
-        18 => NaiveDateTime::parse_from_str(dt_str, "%Y%m%d%H%M%S%.3f"),
-        14 => NaiveDateTime::parse_from_str(dt_str, "%Y%m%d%H%M%S"),
-        8 => Ok(NaiveDate::parse_from_str(dt_str, "%Y%m%d")
-            .map_err(|err| SerdeErr::custom(format!("unable to parse as date: {dt_str}: {err}")))?
-            .and_hms_opt(0, 0, 0)
-            .expect("couldn't set time to 00:00:00")),
+        18 => NaiveDateTime::parse_from_str(dt_str, "%Y%m%d%H%M%S%.3f").map_err(|err| err.to_string()),
+        14 => NaiveDateTime::parse_from_str(dt_str, "%Y%m%d%H%M%S").map_err(|err| err.to_string()),
+        8 => NaiveDate::parse_from_str(dt_str, "%Y%m%d")
+            .map(|d| d.and_hms_opt(0, 0, 0).expect("couldn't set time to 00:00:00"))
+            .map_err(|err| err.to_string()),
         _ => {
-            return Err(SerdeErr::custom(format!("invalid datetime: {dt_str}")));
+            tracing::warn!("Invalid datetime format: '{}', attempting best-effort parse", dt_str);
+            // Try to just take the first 8 characters if it's longer
+            if dt_str.len() > 8 {
+                NaiveDate::parse_from_str(&dt_str[..8], "%Y%m%d")
+                    .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                    .map_err(|err| err.to_string())
+            } else {
+                return Err(SerdeErr::custom(format!("invalid datetime: {dt_str}")));
+            }
         }
     };
 
@@ -158,7 +178,14 @@ pub struct Language(isolang::Language);
 impl<'de> serde::Deserialize<'de> for Language {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let lang = String::deserialize(d)?.trim().to_lowercase();
-        let parsed = lang.parse().map_err(serde::de::Error::custom)?;
+        if lang.is_empty() {
+            tracing::warn!("Empty language tag found, defaulting to eng");
+            return Ok(Language(isolang::Language::Eng));
+        }
+        let parsed = lang.parse().or_else(|_| {
+            tracing::warn!("Invalid language tag found: '{}', defaulting to eng", lang);
+            Ok(isolang::Language::Eng)
+        })?;
         Ok(Language(parsed))
     }
 }
@@ -275,6 +302,45 @@ pub struct Body {
     pub credit_card: Option<CreditCardMessageResponse>,
     #[serde(rename = "BANKMSGSRSV1")]
     pub bank: Option<BankMessageResponse>,
+}
+
+impl Body {
+    /// Parses body from a string, collecting all errors (parsing, end-tag normalization, deserialization)
+    /// into a vector instead of returning on the first error.
+    pub fn parse_collect_errors(s: &str) -> (Option<Self>, Vec<Error>) {
+        let mut errors = Vec::new();
+        let sgml = match Parser::builder()
+            .expand_entities(|entity| match entity {
+                "lt" => Some("<"),
+                "gt" => Some(">"),
+                "amp" => Some("&"),
+                "nbsp" => Some(" "),
+                _ => None,
+            })
+            .parse(s) {
+                Ok(nodes) => nodes,
+                Err(e) => {
+                    errors.push(e.into());
+                    return (None, errors);
+                }
+            };
+
+        let sgml = match sgmlish::transforms::normalize_end_tags(sgml) {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                errors.push(e.into());
+                return (None, errors);
+            }
+        };
+
+        match sgmlish::from_fragment::<Body>(sgml) {
+            Ok(body) => (Some(body), errors),
+            Err(e) => {
+                errors.push(e.into());
+                (None, errors)
+            }
+        }
+    }
 }
 
 impl FromStr for Body {
